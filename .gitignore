@@ -1,0 +1,6 @@
+.idea/*
+.idea
+*.pyc
+.idea/vcs.xml
+.DS_STORE
+adyen_chroma_db/chroma.sqlite3

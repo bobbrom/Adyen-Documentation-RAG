@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "adyen-docs": {
+      "command": "python",
+      "args": ["/ABSOLUTE/PATH/TO/adyen-rag/mcp_server.py"]
+    }
+  }
+}
