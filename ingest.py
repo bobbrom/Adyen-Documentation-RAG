@@ -58,6 +58,38 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
         start += chunk_size - overlap
     return chunks
 
+def add_all_from_api_explorer():
+    llms_txt_url = "https://docs.adyen.com/api-explorer/llms.txt"
+    # Get all doc URLs from the API Explorer index
+    urls = fetch_doc_urls(llms_txt_url)
+    # Replace all 'api-explorer/api-explorer' with 'api-explorer' to get the correct raw markdown URLs
+    urls = [url.replace("api-explorer/api-explorer", "api-explorer") for url in urls]
+    for i, url in enumerate(urls):
+        print(f"[{i+1}/{len(urls)}] Adding from API Explorer: {url}")
+        add_doc(url)
+
+        # Be polite to Adyen's servers
+        # Add some random jitter to avoid hammering if there are many docs
+        random_time = random.uniform(0.1, 0.5)
+        time.sleep(random_time)
+
+
+def add_doc(url: str):
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=EMBEDDING_MODEL)
+    collection = client.get_collection(name=COLLECTION_NAME, embedding_function=embed_fn)
+
+    markdown = requests.get(url).text
+    chunks = chunk_text(markdown, CHUNK_SIZE, CHUNK_OVERLAP)
+
+    # Use the URL as a stable base for IDs to avoid clashes
+    safe_id = url.replace("https://", "").replace("/", "_").replace(".", "_")
+    collection.add(
+        documents=chunks,
+        metadatas=[{"url": url, "chunk": j} for j in range(len(chunks))],
+        ids=[f"{safe_id}_{j}" for j in range(len(chunks))]
+    )
+    print(f"Added {len(chunks)} chunks from {url}")
 
 def ingest():
     # Set up ChromaDB with a local embedding model (no API key needed)
@@ -109,4 +141,5 @@ def ingest():
 
 
 if __name__ == "__main__":
-    ingest()
+    # ingest()
+    add_all_from_api_explorer()

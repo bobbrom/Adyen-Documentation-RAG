@@ -70,6 +70,6 @@ def reset():
 
 if __name__ == "__main__":
     from query import OLLAMA_MODEL, COLLECTION_NAME
-    print(f"Starting Adyen RAG on http://localhost:5000")
+    print(f"Starting Adyen RAG on http://localhost:5001")
     print(f"Model: {OLLAMA_MODEL} | Collection: {COLLECTION_NAME}")
-    app.run(debug=True, threaded=True)
+    app.run(debug=True, threaded=True, port=5001)
