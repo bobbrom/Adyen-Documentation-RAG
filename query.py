@@ -88,7 +88,8 @@ def ask_data(question: str, chunks: list[dict], history: list[dict]):
     Answer based only on the provided documentation excerpts.
     If the answer isn't in the excerpts, say so clearly.
     Format your answer in Markdown.
-    Do not include any source links or URLs in your answer."""
+    Do not include any source links or URLs in your answer. Do not include ANY URLs in your answer. 
+    We will append source links separately after you respond."""
 
     user_message = f"""Documentation excerpts:
 
