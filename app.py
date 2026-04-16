@@ -49,6 +49,7 @@ def chat():
             yield f"data: {json.dumps({'token': token})}\n\n"
 
         # Append sources after streaming finishes
+        yield f"data: {json.dumps({'token': '\n\n'})}\n\n"
         sources = append_sources("", chunks).strip()
         yield f"data: {json.dumps({'token': sources})}\n\n"
         yield "data: [DONE]\n\n"
