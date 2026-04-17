@@ -1,12 +1,22 @@
 """
 code_ingest.py — Index a Java/TypeScript/TSX/JS/YAML codebase into ChromaDB using tree-sitter
 
-Run once (or when the codebase changes):
+First run (full index):
     python code_ingest.py /path/to/your/codebase
+
+Subsequent runs (incremental — only changed files since last index):
+    python code_ingest.py /path/to/your/codebase
+
+Force full re-index:
+    python code_ingest.py /path/to/your/codebase --full
+
+Requirements:
+    pip install chromadb tree-sitter tree-sitter-java tree-sitter-typescript tree-sitter-javascript tree-sitter-yaml sentence-transformers
 """
 
 import os
 import sys
+import subprocess
 import argparse
 import chromadb
 from chromadb.utils import embedding_functions
@@ -16,9 +26,11 @@ import tree_sitter_typescript as tstype
 import tree_sitter_javascript as tsjs
 import tree_sitter_yaml as tsyaml
 
-CHROMA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codebase_chroma_db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CHROMA_PATH = os.path.join(BASE_DIR, "codebase_chroma_db")
 COLLECTION_NAME = "codebase"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
+COMMIT_HASH_FILE = os.path.join(BASE_DIR, ".last_indexed_commit")
 
 # Node types to extract per language
 CHUNK_NODE_TYPES = {
@@ -58,15 +70,13 @@ CHUNK_NODE_TYPES = {
         "class_declaration",
         "method_definition",
     },
-    # YAML uses top-level block mapping pairs (e.g. each Lambda function/resource)
     ".yaml": {"block_mapping_pair"},
     ".yml":  {"block_mapping_pair"},
 }
 
-# File extensions we care about
 SUPPORTED_EXTENSIONS = set(CHUNK_NODE_TYPES.keys())
+YAML_EXTENSIONS = {".yaml", ".yml"}
 
-# Set up parsers per language
 PARSERS = {
     ".java": Parser(Language(tsjava.language())),
     ".ts":   Parser(Language(tstype.language_typescript())),
@@ -77,9 +87,59 @@ PARSERS = {
     ".yml":  Parser(Language(tsyaml.language())),
 }
 
-# YAML only chunks top-level keys (depth 1) to avoid massive nesting
-YAML_EXTENSIONS = {".yaml", ".yml"}
 
+def get_current_commit(codebase_path: str) -> str | None:
+    """Return the current HEAD commit hash."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=codebase_path,
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def get_last_indexed_commit() -> str | None:
+    """Read the last indexed commit hash from disk."""
+    try:
+        with open(COMMIT_HASH_FILE, "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+
+def save_commit_hash(commit_hash: str):
+    """Save the current commit hash to disk."""
+    with open(COMMIT_HASH_FILE, "w") as f:
+        f.write(commit_hash)
+
+
+def get_changed_files(codebase_path: str, since_commit: str) -> dict[str, str]:
+    """
+    Return files changed between since_commit and HEAD.
+    Returns a dict of {relative_path: status} where status is:
+      'M' = modified, 'A' = added, 'D' = deleted, 'R' = renamed
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-status", since_commit, "HEAD"],
+            cwd=codebase_path,
+            capture_output=True, text=True, check=True
+        )
+        changed = {}
+        for line in result.stdout.strip().splitlines():
+            if not line:
+                continue
+            parts = line.split("\t")
+            status = parts[0][0]  # first char: M, A, D, R etc.
+            # Renamed files have two paths — use the new path
+            path = parts[2] if status == "R" and len(parts) > 2 else parts[1]
+            changed[path] = status
+        return changed
+    except subprocess.CalledProcessError:
+        return {}
 
 def extract_chunks(source: str, file_path: str, ext: str) -> list[dict]:
     """Parse a source file and extract functions/classes as individual chunks."""
@@ -89,7 +149,6 @@ def extract_chunks(source: str, file_path: str, ext: str) -> list[dict]:
     chunks = []
 
     if ext in YAML_EXTENSIONS:
-        # For YAML, only walk top-level block_mapping_pair nodes
         for node in tree.root_node.children:
             for child in node.children:
                 if child.type in node_types:
@@ -134,9 +193,61 @@ def find_source_files(root: str) -> list[str]:
                 source_files.append(os.path.join(dirpath, filename))
     return source_files
 
+def get_or_create_collection(client, embed_fn):
+    try:
+        return client.get_collection(name=COLLECTION_NAME, embedding_function=embed_fn)
+    except Exception:
+        return client.create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embed_fn,
+            metadata={"hnsw:space": "cosine"}
+        )
 
-def ingest(codebase_path: str, include_tests: bool = False):
-    print(f"Scanning {codebase_path}...")
+
+def delete_file_chunks(collection, rel_path: str):
+    """Remove all chunks belonging to a file."""
+    try:
+        results = collection.get(where={"file": rel_path})
+        if results["ids"]:
+            collection.delete(ids=results["ids"])
+            print(f"  Removed {len(results['ids'])} chunks for {rel_path}")
+    except Exception as e:
+        print(f"  ⚠ Could not delete chunks for {rel_path}: {e}")
+
+
+def index_file(collection, file_path: str, rel_path: str):
+    """Read, parse and upsert a single file into ChromaDB."""
+    ext = os.path.splitext(file_path)[1]
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            source = f.read()
+    except Exception as e:
+        print(f"  ⚠ Could not read {file_path}: {e}")
+        return 0
+
+    chunks = extract_chunks(source, rel_path, ext)
+    if not chunks:
+        return 0
+
+    ids = [f"{rel_path}:{c['start_line']}" for c in chunks]
+    documents = [c["text"] for c in chunks]
+    metadatas = [{
+        "file": c["file"],
+        "type": c["type"],
+        "start_line": c["start_line"],
+        "end_line": c["end_line"],
+        "language": ext.lstrip(".")
+    } for c in chunks]
+
+    # Upsert — safe to run on already-indexed files
+    collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
+    return len(chunks)
+
+
+
+def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
+    """Index the entire codebase from scratch."""
+    print("Running full index...")
     source_files = find_source_files(codebase_path)
 
     if not include_tests:
@@ -148,21 +259,13 @@ def ingest(codebase_path: str, include_tests: bool = False):
             and ".spec." not in f
         ]
 
-    # Count by language
     by_ext = {}
     for f in source_files:
         ext = os.path.splitext(f)[1]
         by_ext[ext] = by_ext.get(ext, 0) + 1
     for ext, count in sorted(by_ext.items()):
         print(f"  {ext}: {count} files")
-    print(f"  Total: {len(source_files)} files")
-
-    # Set up ChromaDB
-    print(f"\nInitialising ChromaDB at '{CHROMA_PATH}'...")
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
-    embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBEDDING_MODEL
-    )
+    print(f"  Total: {len(source_files)} files\n")
 
     try:
         client.delete_collection(COLLECTION_NAME)
@@ -178,40 +281,64 @@ def ingest(codebase_path: str, include_tests: bool = False):
 
     total_chunks = 0
     for i, file_path in enumerate(source_files):
-        ext = os.path.splitext(file_path)[1]
         rel_path = os.path.relpath(file_path, codebase_path)
         print(f"[{i+1}/{len(source_files)}] {rel_path}")
+        total_chunks += index_file(collection, file_path, rel_path)
 
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                source = f.read()
-        except Exception as e:
-            print(f"  ⚠ Could not read {file_path}: {e}")
+    print(f"\n✅ Full index complete — {len(source_files)} files, {total_chunks} chunks")
+    return collection
+
+
+
+def ingest_incremental(codebase_path: str, since_commit: str, include_tests: bool, client, embed_fn):
+    """Update only files changed since the last indexed commit."""
+    print(f"Incremental update since {since_commit[:8]}...")
+    changed = get_changed_files(codebase_path, since_commit)
+
+    # Filter to supported extensions
+    changed = {
+        path: status for path, status in changed.items()
+        if os.path.splitext(path)[1] in SUPPORTED_EXTENSIONS
+    }
+
+    if not changed:
+        print("No supported files changed — nothing to do")
+        return
+
+    print(f"  {len(changed)} files changed\n")
+
+    collection = get_or_create_collection(client, embed_fn)
+    total_chunks = 0
+
+    for rel_path, status in changed.items():
+        print(f"  [{status}] {rel_path}")
+
+        # Always remove old chunks first
+        delete_file_chunks(collection, rel_path)
+
+        if status == "D":
+            # Deleted — just remove, don't re-index
             continue
 
-        chunks = extract_chunks(source, rel_path, ext)
-        if not chunks:
+        if not include_tests:
+            if "/test/" in rel_path or "Test.java" in rel_path or ".test." in rel_path or ".spec." in rel_path:
+                print(f"  Skipping test file: {rel_path}")
+                continue
+
+        abs_path = os.path.join(codebase_path, rel_path)
+        if not os.path.exists(abs_path):
             continue
 
-        ids = [f"{rel_path}:{c['start_line']}" for c in chunks]
-        documents = [c["text"] for c in chunks]
-        metadatas = [{
-            "file": c["file"],
-            "type": c["type"],
-            "start_line": c["start_line"],
-            "end_line": c["end_line"],
-            "language": ext.lstrip(".")
-        } for c in chunks]
+        total_chunks += index_file(collection, abs_path, rel_path)
 
-        collection.add(documents=documents, metadatas=metadatas, ids=ids)
-        total_chunks += len(chunks)
-
-    print(f"\nDone! Indexed {len(source_files)} files as {total_chunks} chunks")
+    print(f"\n✅ Incremental update complete — {len(changed)} files, {total_chunks} chunks added/updated")
 
 
-if __name__ == "__main__":
+
+def main():
     arg_parser = argparse.ArgumentParser(description="Index a codebase into ChromaDB")
     arg_parser.add_argument("path", help="Path to the root of the codebase")
+    arg_parser.add_argument("--full", action="store_true", help="Force a full re-index")
     arg_parser.add_argument("--include-tests", action="store_true", help="Include test files")
     args = arg_parser.parse_args()
 
@@ -219,4 +346,29 @@ if __name__ == "__main__":
         print(f"Error: {args.path} is not a directory")
         sys.exit(1)
 
-    ingest(args.path, include_tests=args.include_tests)
+    codebase_path = os.path.abspath(args.path)
+    current_commit = get_current_commit(codebase_path)
+    last_commit = get_last_indexed_commit()
+
+    print(f"Codebase:      {codebase_path}")
+    print(f"Current HEAD:  {current_commit[:8] if current_commit else 'N/A'}")
+    print(f"Last indexed:  {last_commit[:8] if last_commit else 'none'}\n")
+
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+        model_name=EMBEDDING_MODEL
+    )
+
+    if args.full or not last_commit or not current_commit:
+        ingest_full(codebase_path, args.include_tests, client, embed_fn)
+    else:
+        ingest_incremental(codebase_path, last_commit, args.include_tests, client, embed_fn)
+
+    # Save current commit hash
+    if current_commit:
+        save_commit_hash(current_commit)
+        print(f"Saved commit hash: {current_commit[:8]}")
+
+
+if __name__ == "__main__":
+    main()
