@@ -33,8 +33,8 @@ CHROMA_PATH = os.path.join(BASE_DIR, "codebase_chroma_db")
 COLLECTION_NAME = "codebase"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
 COMMIT_HASH_FILE = os.path.join(BASE_DIR, ".last_indexed_commit")
-BATCH_SIZE = 50
-PARALLEL_WORKERS = 2
+BATCH_SIZE = 500
+PARALLEL_WORKERS = 4
 
 CHUNK_NODE_TYPES = {
     ".java": {
@@ -135,8 +135,7 @@ def get_changed_files(codebase_path: str, since_commit: str) -> dict[str, str]:
             if not line:
                 continue
             parts = line.split("\t")
-            status = parts[0][0]  # first char: M, A, D, R etc.
-            # Renamed files have two paths — use the new path
+            status = parts[0][0]
             path = parts[2] if status == "R" and len(parts) > 2 else parts[1]
             changed[path] = status
         return changed
@@ -145,7 +144,6 @@ def get_changed_files(codebase_path: str, since_commit: str) -> dict[str, str]:
 
 
 def extract_chunks(source: str, file_path: str, ext: str) -> list[dict]:
-    """Parse a source file and extract functions/classes as individual chunks."""
     parser = PARSERS[ext]
     node_types = CHUNK_NODE_TYPES[ext]
     tree = parser.parse(bytes(source, "utf-8"))
@@ -209,7 +207,6 @@ def get_or_create_collection(client, embed_fn):
 
 
 def delete_file_chunks(collection, rel_path: str):
-    """Remove all chunks belonging to a file."""
     try:
         results = collection.get(where={"file": rel_path})
         if results["ids"]:
@@ -317,24 +314,33 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
                 "language": ext.lstrip(".")
             })
 
-    print(f"Embedding {len(all_docs)} chunks...")
-    embeddings = st_model.encode(
-        all_docs,
-        batch_size=128,
-        show_progress_bar=True,
-        convert_to_numpy=True
-    )
+    total_chunks = len(all_ids)
+    print(f"Embedding and writing {total_chunks} chunks in batches of {BATCH_SIZE}...")
 
-    print("Writing to ChromaDB...")
-    for i in range(0, len(all_ids), BATCH_SIZE):
-        collection.add(
-            documents=all_docs[i:i+BATCH_SIZE],
-            embeddings=embeddings[i:i+BATCH_SIZE].tolist(),
-            metadatas=all_metas[i:i+BATCH_SIZE],
-            ids=all_ids[i:i+BATCH_SIZE]
+    written = 0
+    for i in range(0, total_chunks, BATCH_SIZE):
+        batch_docs  = all_docs[i:i+BATCH_SIZE]
+        batch_ids   = all_ids[i:i+BATCH_SIZE]
+        batch_metas = all_metas[i:i+BATCH_SIZE]
+
+        embeddings = st_model.encode(
+            batch_docs,
+            batch_size=32,
+            show_progress_bar=True,
+            convert_to_numpy=True
         )
 
-    print(f"\nFull index complete — {len(source_files)} files, {len(all_ids)} chunks")
+        collection.add(
+            documents=batch_docs,
+            embeddings=embeddings.tolist(),
+            metadatas=batch_metas,
+            ids=batch_ids
+        )
+
+        written += len(batch_ids)
+        print(f"  Written {written}/{total_chunks} chunks...")
+
+    print(f"\n Full index complete — {len(source_files)} files, {total_chunks} chunks")
     return collection
 
 
@@ -375,7 +381,7 @@ def ingest_incremental(codebase_path: str, since_commit: str, include_tests: boo
 
         total_chunks += index_file(collection, abs_path, rel_path)
 
-    print(f"\nIncremental update complete — {len(changed)} files, {total_chunks} chunks added/updated")
+    print(f"\n Incremental update complete — {len(changed)} files, {total_chunks} chunks added/updated")
 
 
 def main():
