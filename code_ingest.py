@@ -26,6 +26,7 @@ import tree_sitter_java as tsjava
 import tree_sitter_typescript as tstype
 import tree_sitter_javascript as tsjs
 import tree_sitter_yaml as tsyaml
+from sentence_transformers import SentenceTransformer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CHROMA_PATH = os.path.join(BASE_DIR, "codebase_chroma_db")
@@ -33,9 +34,8 @@ COLLECTION_NAME = "codebase"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
 COMMIT_HASH_FILE = os.path.join(BASE_DIR, ".last_indexed_commit")
 BATCH_SIZE = 50
-PARALLEL_WORKERS = 4
+PARALLEL_WORKERS = 2
 
-# Node types to extract per language
 CHUNK_NODE_TYPES = {
     ".java": {
         "method_declaration",
@@ -105,7 +105,6 @@ def get_current_commit(codebase_path: str) -> str | None:
 
 
 def get_last_indexed_commit() -> str | None:
-    """Read the last indexed commit hash from disk."""
     try:
         with open(COMMIT_HASH_FILE, "r") as f:
             return f.read().strip()
@@ -143,6 +142,7 @@ def get_changed_files(codebase_path: str, since_commit: str) -> dict[str, str]:
         return changed
     except subprocess.CalledProcessError:
         return {}
+
 
 def extract_chunks(source: str, file_path: str, ext: str) -> list[dict]:
     """Parse a source file and extract functions/classes as individual chunks."""
@@ -196,6 +196,7 @@ def find_source_files(root: str) -> list[str]:
                 source_files.append(os.path.join(dirpath, filename))
     return source_files
 
+
 def get_or_create_collection(client, embed_fn):
     try:
         return client.get_collection(name=COLLECTION_NAME, embedding_function=embed_fn)
@@ -215,17 +216,16 @@ def delete_file_chunks(collection, rel_path: str):
             collection.delete(ids=results["ids"])
             print(f"  Removed {len(results['ids'])} chunks for {rel_path}")
     except Exception as e:
-        print(f"  ⚠ Could not delete chunks for {rel_path}: {e}")
+        print(f"  Could not delete chunks for {rel_path}: {e}")
 
 
 def index_file(collection, file_path: str, rel_path: str):
-    """Read, parse and upsert a single file into ChromaDB."""
     ext = os.path.splitext(file_path)[1]
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             source = f.read()
     except Exception as e:
-        print(f"  ⚠ Could not read {file_path}: {e}")
+        print(f"  Could not read {file_path}: {e}")
         return 0
 
     chunks = extract_chunks(source, rel_path, ext)
@@ -242,32 +242,22 @@ def index_file(collection, file_path: str, rel_path: str):
         "language": ext.lstrip(".")
     } for c in chunks]
 
-    # Upsert — safe to run on already-indexed files
     collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
     return len(chunks)
 
 
-
 def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
-    """Parse a single file and return its chunks — runs in parallel."""
     ext = os.path.splitext(file_path)[1]
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             source = f.read()
     except Exception as e:
-        print(f"  ⚠ Could not read {file_path}: {e}")
+        print(f"  Could not read {file_path}: {e}")
         return rel_path, []
     return rel_path, extract_chunks(source, rel_path, ext)
 
 
-def flush_batch(collection, batch_ids, batch_docs, batch_metas):
-    """Write a batch of chunks to ChromaDB."""
-    if batch_ids:
-        collection.add(documents=batch_docs, metadatas=batch_metas, ids=batch_ids)
-
-
-def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
-    """Index the entire codebase from scratch using parallel parsing + batched writes."""
+def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_model):
     print("Running full index...")
     source_files = find_source_files(codebase_path)
 
@@ -300,7 +290,6 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
         metadata={"hnsw:space": "cosine"}
     )
 
-    # Step 1 — parse all files in parallel (CPU-bound, no DB involvement)
     print(f"Parsing files with {PARALLEL_WORKERS} workers...")
     all_chunks_by_file = {}
     pairs = [(fp, os.path.relpath(fp, codebase_path)) for fp in source_files]
@@ -313,17 +302,14 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
             if (i + 1) % 50 == 0:
                 print(f"  Parsed {i+1}/{len(source_files)} files...")
 
-    # Step 2 — write to ChromaDB in batches
-    print("Writing to ChromaDB in batches...")
-    batch_ids, batch_docs, batch_metas = [], [], []
-    total_chunks = 0
-
+    print("Collecting chunks...")
+    all_ids, all_docs, all_metas = [], [], []
     for rel_path, chunks in all_chunks_by_file.items():
         ext = os.path.splitext(rel_path)[1]
         for c in chunks:
-            batch_ids.append(f"{rel_path}:{c['start_line']}")
-            batch_docs.append(c["text"])
-            batch_metas.append({
+            all_ids.append(f"{rel_path}:{c['start_line']}")
+            all_docs.append(c["text"])
+            all_metas.append({
                 "file": c["file"],
                 "type": c["type"],
                 "start_line": c["start_line"],
@@ -331,27 +317,31 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
                 "language": ext.lstrip(".")
             })
 
-            if len(batch_ids) >= BATCH_SIZE:
-                flush_batch(collection, batch_ids, batch_docs, batch_metas)
-                total_chunks += len(batch_ids)
-                print(f"  Written {total_chunks} chunks...")
-                batch_ids, batch_docs, batch_metas = [], [], []
+    print(f"Embedding {len(all_docs)} chunks...")
+    embeddings = st_model.encode(
+        all_docs,
+        batch_size=128,
+        show_progress_bar=True,
+        convert_to_numpy=True
+    )
 
-    # Flush remaining
-    flush_batch(collection, batch_ids, batch_docs, batch_metas)
-    total_chunks += len(batch_ids)
+    print("Writing to ChromaDB...")
+    for i in range(0, len(all_ids), BATCH_SIZE):
+        collection.add(
+            documents=all_docs[i:i+BATCH_SIZE],
+            embeddings=embeddings[i:i+BATCH_SIZE].tolist(),
+            metadatas=all_metas[i:i+BATCH_SIZE],
+            ids=all_ids[i:i+BATCH_SIZE]
+        )
 
-    print(f"\n✅ Full index complete — {len(source_files)} files, {total_chunks} chunks")
+    print(f"\nFull index complete — {len(source_files)} files, {len(all_ids)} chunks")
     return collection
 
 
-
 def ingest_incremental(codebase_path: str, since_commit: str, include_tests: bool, client, embed_fn):
-    """Update only files changed since the last indexed commit."""
     print(f"Incremental update since {since_commit[:8]}...")
     changed = get_changed_files(codebase_path, since_commit)
 
-    # Filter to supported extensions
     changed = {
         path: status for path, status in changed.items()
         if os.path.splitext(path)[1] in SUPPORTED_EXTENSIONS
@@ -369,11 +359,9 @@ def ingest_incremental(codebase_path: str, since_commit: str, include_tests: boo
     for rel_path, status in changed.items():
         print(f"  [{status}] {rel_path}")
 
-        # Always remove old chunks first
         delete_file_chunks(collection, rel_path)
 
         if status == "D":
-            # Deleted — just remove, don't re-index
             continue
 
         if not include_tests:
@@ -387,8 +375,7 @@ def ingest_incremental(codebase_path: str, since_commit: str, include_tests: boo
 
         total_chunks += index_file(collection, abs_path, rel_path)
 
-    print(f"\n✅ Incremental update complete — {len(changed)} files, {total_chunks} chunks added/updated")
-
+    print(f"\nIncremental update complete — {len(changed)} files, {total_chunks} chunks added/updated")
 
 
 def main():
@@ -411,17 +398,17 @@ def main():
     print(f"Last indexed:  {last_commit[:8] if last_commit else 'none'}\n")
 
     client = chromadb.PersistentClient(path=CHROMA_PATH)
+    st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
     embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL,
         device="mps"
     )
 
     if args.full or not last_commit or not current_commit:
-        ingest_full(codebase_path, args.include_tests, client, embed_fn)
+        ingest_full(codebase_path, args.include_tests, client, embed_fn, st_model)
     else:
         ingest_incremental(codebase_path, last_commit, args.include_tests, client, embed_fn)
 
-    # Save current commit hash
     if current_commit:
         save_commit_hash(current_commit)
         print(f"Saved commit hash: {current_commit[:8]}")
