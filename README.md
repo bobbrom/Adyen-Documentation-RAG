@@ -65,14 +65,13 @@ adyen-rag/
   "mcpServers": {
     "adyen-docs": {
       "command": "python",
-      "args": ["/absolute/path/to/adyen-rag/junie_server.py"]
+      "args": ["/absolute/path/to/adyen-rag/adyen_mcp_server.py"]
     }
   }
 }
 ```
 
 2. Place `mcp.json` in one of:
-    
     - **Project-level**: `.junie/mcp/mcp.json` in your project root
     - **Global**: `~/.junie/mcp/mcp.json`
 3. In your JetBrains IDE go to **Settings → Tools → Junie → MCP Settings** and verify `adyen-docs` shows as Active.

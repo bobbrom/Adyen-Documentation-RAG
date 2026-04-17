@@ -1,22 +1,36 @@
 """
-mcp_server.py — Expose Adyen RAG as an MCP tool for Junie
+adyen_mcp_server.py — Adyen docs RAG as an MCP tool for Junie
+
+Junie handles the LLM — this server just does retrieval from ChromaDB.
 
 Setup:
     pip install mcp chromadb sentence-transformers
 
 Run (Junie starts this automatically via mcp.json):
-    python mcp_server.py
+    python adyen_mcp_server.py
 """
 
 import asyncio
+import chromadb
+from chromadb.utils import embedding_functions
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 
-from query import load_collection, retrieve, append_sources, build_retrieval_query
+CHROMA_PATH = "./adyen_chroma_db"
+COLLECTION_NAME = "adyen_docs"
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+TOP_K = 5
 
-# Initialise collection once at startup
-collection = load_collection()
+# Initialise ChromaDB once at startup
+embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name=EMBEDDING_MODEL
+)
+chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+collection = chroma_client.get_collection(
+    name=COLLECTION_NAME,
+    embedding_function=embed_fn
+)
 
 server = Server("adyen-docs")
 
@@ -51,10 +65,19 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         raise ValueError(f"Unknown tool: {name}")
 
     query = arguments["query"]
-    retrieval_query = build_retrieval_query(query, [])
-    chunks = retrieve(collection, retrieval_query)
-    output = append_sources("", chunks).strip()
 
+    results = collection.query(
+        query_texts=[query],
+        n_results=TOP_K,
+        include=["documents", "metadatas", "distances"]
+    )
+
+    chunks = []
+    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+        url = meta["url"].replace(".md", "")
+        chunks.append(f"Source: {url}\n\n{doc}")
+
+    output = "\n\n---\n\n".join(chunks)
     return [types.TextContent(type="text", text=output)]
 
 
