@@ -6,3 +6,8 @@ chromadb
 sentence-transformers
 flask
 mcp
+tree-sitter
+tree-sitter-java
+tree-sitter-typescript
+tree-sitter-javascript
+tree-sitter-yaml
