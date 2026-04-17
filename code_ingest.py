@@ -18,6 +18,7 @@ import os
 import sys
 import subprocess
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import chromadb
 from chromadb.utils import embedding_functions
 from tree_sitter import Language, Parser
@@ -31,6 +32,8 @@ CHROMA_PATH = os.path.join(BASE_DIR, "codebase_chroma_db")
 COLLECTION_NAME = "codebase"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
 COMMIT_HASH_FILE = os.path.join(BASE_DIR, ".last_indexed_commit")
+BATCH_SIZE = 50
+PARALLEL_WORKERS = 4
 
 # Node types to extract per language
 CHUNK_NODE_TYPES = {
@@ -245,8 +248,26 @@ def index_file(collection, file_path: str, rel_path: str):
 
 
 
+def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
+    """Parse a single file and return its chunks — runs in parallel."""
+    ext = os.path.splitext(file_path)[1]
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            source = f.read()
+    except Exception as e:
+        print(f"  ⚠ Could not read {file_path}: {e}")
+        return rel_path, []
+    return rel_path, extract_chunks(source, rel_path, ext)
+
+
+def flush_batch(collection, batch_ids, batch_docs, batch_metas):
+    """Write a batch of chunks to ChromaDB."""
+    if batch_ids:
+        collection.add(documents=batch_docs, metadatas=batch_metas, ids=batch_ids)
+
+
 def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
-    """Index the entire codebase from scratch."""
+    """Index the entire codebase from scratch using parallel parsing + batched writes."""
     print("Running full index...")
     source_files = find_source_files(codebase_path)
 
@@ -279,11 +300,46 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
         metadata={"hnsw:space": "cosine"}
     )
 
+    # Step 1 — parse all files in parallel (CPU-bound, no DB involvement)
+    print(f"Parsing files with {PARALLEL_WORKERS} workers...")
+    all_chunks_by_file = {}
+    pairs = [(fp, os.path.relpath(fp, codebase_path)) for fp in source_files]
+
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+        futures = {executor.submit(parse_file, fp, rp): rp for fp, rp in pairs}
+        for i, future in enumerate(as_completed(futures)):
+            rel_path, chunks = future.result()
+            all_chunks_by_file[rel_path] = chunks
+            if (i + 1) % 50 == 0:
+                print(f"  Parsed {i+1}/{len(source_files)} files...")
+
+    # Step 2 — write to ChromaDB in batches
+    print("Writing to ChromaDB in batches...")
+    batch_ids, batch_docs, batch_metas = [], [], []
     total_chunks = 0
-    for i, file_path in enumerate(source_files):
-        rel_path = os.path.relpath(file_path, codebase_path)
-        print(f"[{i+1}/{len(source_files)}] {rel_path}")
-        total_chunks += index_file(collection, file_path, rel_path)
+
+    for rel_path, chunks in all_chunks_by_file.items():
+        ext = os.path.splitext(rel_path)[1]
+        for c in chunks:
+            batch_ids.append(f"{rel_path}:{c['start_line']}")
+            batch_docs.append(c["text"])
+            batch_metas.append({
+                "file": c["file"],
+                "type": c["type"],
+                "start_line": c["start_line"],
+                "end_line": c["end_line"],
+                "language": ext.lstrip(".")
+            })
+
+            if len(batch_ids) >= BATCH_SIZE:
+                flush_batch(collection, batch_ids, batch_docs, batch_metas)
+                total_chunks += len(batch_ids)
+                print(f"  Written {total_chunks} chunks...")
+                batch_ids, batch_docs, batch_metas = [], [], []
+
+    # Flush remaining
+    flush_batch(collection, batch_ids, batch_docs, batch_metas)
+    total_chunks += len(batch_ids)
 
     print(f"\n✅ Full index complete — {len(source_files)} files, {total_chunks} chunks")
     return collection
@@ -356,7 +412,8 @@ def main():
 
     client = chromadb.PersistentClient(path=CHROMA_PATH)
     embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBEDDING_MODEL
+        model_name=EMBEDDING_MODEL,
+        device="mps"
     )
 
     if args.full or not last_commit or not current_commit:
