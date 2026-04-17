@@ -294,10 +294,13 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
         futures = {executor.submit(parse_file, fp, rp): rp for fp, rp in pairs}
         for i, future in enumerate(as_completed(futures)):
-            rel_path, chunks = future.result()
-            all_chunks_by_file[rel_path] = chunks
-            if (i + 1) % 50 == 0:
-                print(f"  Parsed {i+1}/{len(source_files)} files...")
+            try:
+                rel_path, chunks = future.result()
+                all_chunks_by_file[rel_path] = chunks
+                if (i + 1) % 10 == 0:
+                    print(f"  Parsed {i + 1}/{len(source_files)} files...")
+            except Exception as e:
+                print(f"  Worker failed: {e}")
 
     print("Collecting chunks...")
     all_ids, all_docs, all_metas = [], [], []
