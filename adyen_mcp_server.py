@@ -16,8 +16,11 @@ from chromadb.utils import embedding_functions
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
+import os
 
-CHROMA_PATH = "./adyen_chroma_db"
+BASE_PATH = os.path.dirname(__file__)
+
+CHROMA_PATH = os.path.join(BASE_PATH, "adyen_chroma_db")
 COLLECTION_NAME = "adyen_docs"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K = 5
