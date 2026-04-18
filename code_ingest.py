@@ -238,9 +238,11 @@ def index_file(collection, file_path: str, rel_path: str):
         "end_line": c["end_line"],
         "language": ext.lstrip(".")
     } for c in chunks]
-
-    # Upsert — safe to run on already-indexed files
-    collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
+    try:
+        # Upsert — safe to run on already-indexed files
+        collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
+    except Exception as e:
+        print(f"Could not index {file_path}: {e}")
     return len(chunks)
 
 
@@ -356,7 +358,8 @@ def main():
 
     client = chromadb.PersistentClient(path=CHROMA_PATH)
     embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name=EMBEDDING_MODEL
+        model_name=EMBEDDING_MODEL,
+        device="mps"
     )
 
     if args.full or not last_commit or not current_commit:
