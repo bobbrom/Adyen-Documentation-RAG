@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import chromadb
 from chromadb.utils import embedding_functions
+from sentence_transformers import SentenceTransformer
 from tree_sitter import Language, Parser
 import tree_sitter_java as tsjava
 import tree_sitter_typescript as tstype
@@ -16,6 +17,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
 COLLECTION_NAME = "codebase"
 PARALLEL_WORKERS = 4
+EMBED_BATCH_SIZE = 100
 
 CHUNK_NODE_TYPES = {
     ".java": {
@@ -388,18 +390,45 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
 def ingest_resume(codebase_path: str, client, embed_fn):
     cache_file = get_chunks_cache_file(codebase_path)
     if not os.path.exists(cache_file):
-        print("No cache file found — run without --resume to start a full index")
+        print("No cache file found — run a full index first")
         sys.exit(1)
 
     print("Loading chunks from cache...")
     all_ids, all_docs, all_metas = load_chunks_cache(codebase_path)
-    start_from = load_progress(codebase_path)
-    print(f"Resuming from chunk {start_from}/{len(all_ids)}...")
+    total = len(all_ids)
 
     collection = get_or_create_collection(client, embed_fn)
-    written = write_chunks(collection, all_ids, all_docs, all_metas, codebase_path, start_from)
-    clear_progress_files(codebase_path)
+    start_from = collection.count()
+    print(f"Found {start_from} chunks in DB, {total} total — resuming from {start_from}...")
 
+    st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
+    written = start_from
+
+    for i in range(start_from, total, EMBED_BATCH_SIZE):
+        batch_docs  = all_docs[i:i+EMBED_BATCH_SIZE]
+        batch_ids   = all_ids[i:i+EMBED_BATCH_SIZE]
+        batch_metas = all_metas[i:i+EMBED_BATCH_SIZE]
+
+        embeddings = st_model.encode(
+            batch_docs,
+            batch_size=32,
+            show_progress_bar=False,
+            convert_to_numpy=True
+        )
+
+        collection.add(
+            documents=batch_docs,
+            embeddings=embeddings.tolist(),
+            metadatas=batch_metas,
+            ids=batch_ids
+        )
+
+        written += len(batch_ids)
+        save_progress(codebase_path, written)
+        pct = round(written / total * 100)
+        print(f"  Written {written}/{total} chunks ({pct}%)...")
+
+    clear_progress_files(codebase_path)
     print(f"\nResume complete — {written} chunks written")
 
 
@@ -469,7 +498,6 @@ def main():
         model_name=EMBEDDING_MODEL,
         device="mps"
     )
-
     if args.full:
         clear_progress_files(codebase_path)
         ingest_full(codebase_path, args.include_tests, client, embed_fn)
