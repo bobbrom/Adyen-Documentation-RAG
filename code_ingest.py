@@ -328,7 +328,7 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
         batch_docs  = all_docs[i:i+BATCH_SIZE]
         batch_ids   = all_ids[i:i+BATCH_SIZE]
         batch_metas = all_metas[i:i+BATCH_SIZE]
-
+        print(f"  Encoding batch {i // BATCH_SIZE + 1} ({len(batch_docs)} chunks)...")
         embeddings = st_model.encode(
             batch_docs,
             batch_size=32,
