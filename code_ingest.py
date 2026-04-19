@@ -1,9 +1,11 @@
 import os
 import sys
 import json
+import signal
 import subprocess
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import torch
 import chromadb
 from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
@@ -297,26 +299,39 @@ def embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path: str
     written = start_from
     print(f"Embedding and writing {total - start_from} chunks (starting from {start_from})...")
 
-    st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
+    try:
+        st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
+    except Exception as e:
+        print(f"Failed to load embedding model: {e}")
+        sys.exit(1)
 
     for i in range(start_from, total, EMBED_BATCH_SIZE):
         batch_docs  = all_docs[i:i+EMBED_BATCH_SIZE]
         batch_ids   = all_ids[i:i+EMBED_BATCH_SIZE]
         batch_metas = all_metas[i:i+EMBED_BATCH_SIZE]
 
-        embeddings = st_model.encode(
-            batch_docs,
-            batch_size=32,
-            show_progress_bar=False,
-            convert_to_numpy=True
-        )
+        try:
+            embeddings = st_model.encode(
+                batch_docs,
+                batch_size=32,
+                show_progress_bar=False,
+                convert_to_numpy=True
+            )
+            torch.mps.empty_cache()
+        except Exception as e:
+            print(f"  Embedding failed for batch at {i}: {e}")
+            continue
 
-        collection.add(
-            documents=batch_docs,
-            embeddings=embeddings.tolist(),
-            metadatas=batch_metas,
-            ids=batch_ids
-        )
+        try:
+            collection.add(
+                documents=batch_docs,
+                embeddings=embeddings.tolist(),
+                metadatas=batch_metas,
+                ids=batch_ids
+            )
+        except Exception as e:
+            print(f"  ChromaDB write failed for batch at {i}: {e}")
+            continue
 
         written += len(batch_ids)
         save_progress(codebase_path, written)
@@ -362,18 +377,23 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
     print(f"Parsing files with {PARALLEL_WORKERS} workers...")
     all_chunks_by_file = {}
     pairs = [(fp, os.path.relpath(fp, codebase_path)) for fp in source_files]
+    executor = ThreadPoolExecutor(max_workers=PARALLEL_WORKERS)
 
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
+    try:
         futures = {executor.submit(parse_file, fp, rp): rp for fp, rp in pairs}
         for i, future in enumerate(as_completed(futures)):
             try:
-                rel_path, chunks = future.result()
+                rel_path, chunks = future.result(timeout=30)
                 all_chunks_by_file[rel_path] = chunks
                 if (i + 1) % 10 == 0:
                     pct = round((i + 1) / len(source_files) * 100)
                     print(f"  Parsed {i+1}/{len(source_files)} files ({pct}%)...")
+            except TimeoutError:
+                print(f"  Worker timed out, skipping...")
             except Exception as e:
                 print(f"  Worker failed: {e}")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     print("Collecting chunks...")
     all_ids, all_docs, all_metas = [], [], []
@@ -458,6 +478,14 @@ def ingest_incremental(codebase_path: str, since_commit: str, include_tests: boo
 
 
 def main():
+    def handle_exit(sig, frame):
+        print("\nShutting down...")
+        torch.mps.empty_cache()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_exit)
+    signal.signal(signal.SIGTERM, handle_exit)
+
     arg_parser = argparse.ArgumentParser(description="Index a codebase into ChromaDB")
     arg_parser.add_argument("path", help="Path to the root of the codebase")
     arg_parser.add_argument("--full", action="store_true", help="Force a full re-index")
