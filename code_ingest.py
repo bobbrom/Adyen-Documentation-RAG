@@ -285,8 +285,9 @@ def write_chunks(collection, all_ids, all_docs, all_metas, codebase_path: str, s
             )
             written += 1
             save_progress(codebase_path, written)
-            if written % 500 == 0:
-                print(f"  Written {written}/{total} chunks...")
+            if written % 10 == 0:
+                pct = round(written / total * 100)
+                print(f"  Written {written}/{total} chunks ({pct}%)...")
         except Exception as e:
             print(f"  Could not write chunk {all_ids[i]}: {e}")
 
