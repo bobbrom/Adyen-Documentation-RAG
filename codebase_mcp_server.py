@@ -1,17 +1,6 @@
-"""
-codebase_mcp_server.py — Java codebase semantic search as an MCP tool for Junie
-
-Junie handles the LLM — this server just does retrieval from ChromaDB.
-
-Setup:
-    pip install mcp chromadb sentence-transformers
-
-Run (Junie starts this automatically via mcp.json):
-    python codebase_mcp_server.py
-"""
-
 import asyncio
 import os
+import sys
 import chromadb
 from chromadb.utils import embedding_functions
 from mcp.server import Server
@@ -19,22 +8,29 @@ from mcp.server.stdio import stdio_server
 from mcp import types
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHROMA_PATH = os.path.join(BASE_DIR, "codebase_chroma_db")
-COLLECTION_NAME = "codebase"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
+COLLECTION_NAME = "codebase"
 TOP_K = 5
 
-# Initialise ChromaDB once at startup
+if len(sys.argv) < 2:
+    print("Usage: python codebase_mcp_server.py /path/to/project", file=sys.stderr)
+    sys.exit(1)
+
+codebase_path = os.path.abspath(sys.argv[1])
+project_name = os.path.basename(codebase_path.rstrip("/"))
+chroma_path = os.path.join(BASE_DIR, f"codebase_chroma_db_{project_name}")
+
 embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name=EMBEDDING_MODEL
+    model_name=EMBEDDING_MODEL,
+    device="mps"
 )
-chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
+chroma_client = chromadb.PersistentClient(path=chroma_path)
 collection = chroma_client.get_collection(
     name=COLLECTION_NAME,
     embedding_function=embed_fn
 )
 
-server = Server("java-codebase")
+server = Server(f"codebase-{project_name}")
 
 
 @server.list_tools()
@@ -43,7 +39,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="search_codebase",
             description=(
-                "Semantically search the codebase for relevant methods, classes, "
+                f"Semantically search the {project_name} codebase for relevant methods, classes, "
                 "functions, components, or configuration. Supports Java, TypeScript, "
                 "TSX, JavaScript, and YAML. Use this to find where something is "
                 "implemented, how a feature works, which classes handle a given "
