@@ -292,25 +292,36 @@ def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
     return rel_path, extract_chunks(source, rel_path, ext, local_parsers)
 
 
-def write_chunks(collection, all_ids, all_docs, all_metas, codebase_path: str, start_from: int = 0):
+def embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path: str, start_from: int = 0):
     total = len(all_ids)
     written = start_from
-    print(f"Writing {total - start_from} remaining chunks (starting from {start_from})...")
+    print(f"Embedding and writing {total - start_from} chunks (starting from {start_from})...")
 
-    for i in range(start_from, total):
-        try:
-            collection.upsert(
-                documents=[all_docs[i]],
-                metadatas=[all_metas[i]],
-                ids=[all_ids[i]]
-            )
-            written += 1
-            save_progress(codebase_path, written)
-            if written % 10 == 0:
-                pct = round(written / total * 100)
-                print(f"  Written {written}/{total} chunks ({pct}%)...")
-        except Exception as e:
-            print(f"  Could not write chunk {all_ids[i]}: {e}")
+    st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
+
+    for i in range(start_from, total, EMBED_BATCH_SIZE):
+        batch_docs  = all_docs[i:i+EMBED_BATCH_SIZE]
+        batch_ids   = all_ids[i:i+EMBED_BATCH_SIZE]
+        batch_metas = all_metas[i:i+EMBED_BATCH_SIZE]
+
+        embeddings = st_model.encode(
+            batch_docs,
+            batch_size=32,
+            show_progress_bar=False,
+            convert_to_numpy=True
+        )
+
+        collection.add(
+            documents=batch_docs,
+            embeddings=embeddings.tolist(),
+            metadatas=batch_metas,
+            ids=batch_ids
+        )
+
+        written += len(batch_ids)
+        save_progress(codebase_path, written)
+        pct = round(written / total * 100)
+        print(f"  Written {written}/{total} chunks ({pct}%)...")
 
     return written
 
@@ -380,7 +391,7 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
             })
 
     save_chunks_cache(codebase_path, all_ids, all_docs, all_metas)
-    written = write_chunks(collection, all_ids, all_docs, all_metas, codebase_path)
+    written = embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path)
     clear_progress_files(codebase_path)
 
     print(f"\nFull index complete — {len(source_files)} files, {written} chunks")
@@ -401,34 +412,9 @@ def ingest_resume(codebase_path: str, client, embed_fn):
     start_from = collection.count()
     print(f"Found {start_from} chunks in DB, {total} total — resuming from {start_from}...")
 
-    st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
-    written = start_from
-
-    for i in range(start_from, total, EMBED_BATCH_SIZE):
-        batch_docs  = all_docs[i:i+EMBED_BATCH_SIZE]
-        batch_ids   = all_ids[i:i+EMBED_BATCH_SIZE]
-        batch_metas = all_metas[i:i+EMBED_BATCH_SIZE]
-
-        embeddings = st_model.encode(
-            batch_docs,
-            batch_size=32,
-            show_progress_bar=False,
-            convert_to_numpy=True
-        )
-
-        collection.add(
-            documents=batch_docs,
-            embeddings=embeddings.tolist(),
-            metadatas=batch_metas,
-            ids=batch_ids
-        )
-
-        written += len(batch_ids)
-        save_progress(codebase_path, written)
-        pct = round(written / total * 100)
-        print(f"  Written {written}/{total} chunks ({pct}%)...")
-
+    written = embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path, start_from)
     clear_progress_files(codebase_path)
+
     print(f"\nResume complete — {written} chunks written")
 
 
