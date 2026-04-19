@@ -15,8 +15,8 @@ from sentence_transformers import SentenceTransformer
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COLLECTION_NAME = "codebase"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
-BATCH_SIZE = 500
-PARALLEL_WORKERS = 4
+BATCH_SIZE = 100
+PARALLEL_WORKERS = 2
 
 CHUNK_NODE_TYPES = {
     ".java": {
@@ -413,10 +413,10 @@ def main():
     print(f"Last indexed:  {last_commit[:8] if last_commit else 'none'}\n")
 
     client = chromadb.PersistentClient(path=chroma_path)
-    st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
+    st_model = SentenceTransformer(EMBEDDING_MODEL, device="cpu")
     embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL,
-        device="mps"
+        device="cpu"
     )
 
     if args.full:
