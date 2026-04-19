@@ -1,19 +1,3 @@
-"""
-code_ingest.py — Index a Java/TypeScript/TSX/JS/YAML codebase into ChromaDB using tree-sitter
-
-First run (full index):
-    python code_ingest.py /path/to/your/codebase
-
-Subsequent runs (incremental — only changed files since last index):
-    python code_ingest.py /path/to/your/codebase
-
-Force full re-index:
-    python code_ingest.py /path/to/your/codebase --full
-
-Requirements:
-    pip install chromadb tree-sitter tree-sitter-java tree-sitter-typescript tree-sitter-javascript tree-sitter-yaml sentence-transformers
-"""
-
 import os
 import sys
 import subprocess
@@ -29,10 +13,8 @@ import tree_sitter_yaml as tsyaml
 from sentence_transformers import SentenceTransformer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHROMA_PATH = os.path.join(BASE_DIR, "codebase_chroma_db")
 COLLECTION_NAME = "codebase"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
-COMMIT_HASH_FILE = os.path.join(BASE_DIR, ".last_indexed_commit")
 BATCH_SIZE = 500
 PARALLEL_WORKERS = 4
 
@@ -91,8 +73,19 @@ PARSERS = {
 }
 
 
+def get_project_name(codebase_path: str) -> str:
+    return os.path.basename(codebase_path.rstrip("/"))
+
+
+def get_chroma_path(codebase_path: str) -> str:
+    return os.path.join(BASE_DIR, f"codebase_chroma_db_{get_project_name(codebase_path)}")
+
+
+def get_commit_hash_file(codebase_path: str) -> str:
+    return os.path.join(BASE_DIR, f".last_indexed_commit_{get_project_name(codebase_path)}")
+
+
 def get_current_commit(codebase_path: str) -> str | None:
-    """Return the current HEAD commit hash."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -104,26 +97,20 @@ def get_current_commit(codebase_path: str) -> str | None:
         return None
 
 
-def get_last_indexed_commit() -> str | None:
+def get_last_indexed_commit(codebase_path: str) -> str | None:
     try:
-        with open(COMMIT_HASH_FILE, "r") as f:
+        with open(get_commit_hash_file(codebase_path), "r") as f:
             return f.read().strip()
     except FileNotFoundError:
         return None
 
 
-def save_commit_hash(commit_hash: str):
-    """Save the current commit hash to disk."""
-    with open(COMMIT_HASH_FILE, "w") as f:
+def save_commit_hash(codebase_path: str, commit_hash: str):
+    with open(get_commit_hash_file(codebase_path), "w") as f:
         f.write(commit_hash)
 
 
 def get_changed_files(codebase_path: str, since_commit: str) -> dict[str, str]:
-    """
-    Return files changed between since_commit and HEAD.
-    Returns a dict of {relative_path: status} where status is:
-      'M' = modified, 'A' = added, 'D' = deleted, 'R' = renamed
-    """
     try:
         result = subprocess.run(
             ["git", "diff", "--name-status", since_commit, "HEAD"],
@@ -183,7 +170,6 @@ def extract_chunks(source: str, file_path: str, ext: str) -> list[dict]:
 
 
 def find_source_files(root: str) -> list[str]:
-    """Recursively find all supported source files, skipping non-essential dirs."""
     skip_dirs = {"target", "build", ".git", ".idea", "node_modules", "__pycache__", "dist", ".next"}
     source_files = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -254,6 +240,21 @@ def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
     return rel_path, extract_chunks(source, rel_path, ext)
 
 
+def get_existing_ids(collection) -> set[str]:
+    existing = set()
+    limit = 1000
+    offset = 0
+    while True:
+        result = collection.get(limit=limit, offset=offset, include=[])
+        if not result["ids"]:
+            break
+        existing.update(result["ids"])
+        if len(result["ids"]) < limit:
+            break
+        offset += limit
+    return existing
+
+
 def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_model):
     print("Running full index...")
     source_files = find_source_files(codebase_path)
@@ -275,17 +276,11 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
         print(f"  {ext}: {count} files")
     print(f"  Total: {len(source_files)} files\n")
 
-    try:
-        client.delete_collection(COLLECTION_NAME)
-        print("Deleted existing collection")
-    except Exception:
-        pass
+    collection = get_or_create_collection(client, embed_fn)
 
-    collection = client.create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=embed_fn,
-        metadata={"hnsw:space": "cosine"}
-    )
+    print("Checking existing chunks in DB...")
+    existing_ids = get_existing_ids(collection)
+    print(f"  Found {len(existing_ids)} already indexed\n")
 
     print(f"Parsing files with {PARALLEL_WORKERS} workers...")
     all_chunks_by_file = {}
@@ -298,7 +293,7 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
                 rel_path, chunks = future.result()
                 all_chunks_by_file[rel_path] = chunks
                 if (i + 1) % 10 == 0:
-                    print(f"  Parsed {i + 1}/{len(source_files)} files...")
+                    print(f"  Parsed {i+1}/{len(source_files)} files...")
             except Exception as e:
                 print(f"  Worker failed: {e}")
 
@@ -307,7 +302,10 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
     for rel_path, chunks in all_chunks_by_file.items():
         ext = os.path.splitext(rel_path)[1]
         for c in chunks:
-            all_ids.append(f"{rel_path}:{c['start_line']}")
+            chunk_id = f"{rel_path}:{c['start_line']}"
+            if chunk_id in existing_ids:
+                continue
+            all_ids.append(chunk_id)
             all_docs.append(c["text"])
             all_metas.append({
                 "file": c["file"],
@@ -318,7 +316,11 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
             })
 
     total_chunks = len(all_ids)
-    print(f"Embedding and writing {total_chunks} chunks in batches of {BATCH_SIZE}...")
+    if total_chunks == 0:
+        print("All chunks already in DB — nothing to do")
+        return collection
+
+    print(f"Embedding and writing {total_chunks} new chunks in batches of {BATCH_SIZE}...")
 
     written = 0
     for i in range(0, total_chunks, BATCH_SIZE):
@@ -333,7 +335,7 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
             convert_to_numpy=True
         )
 
-        collection.add(
+        collection.upsert(
             documents=batch_docs,
             embeddings=embeddings.tolist(),
             metadatas=batch_metas,
@@ -341,9 +343,10 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
         )
 
         written += len(batch_ids)
-        print(f"  Written {written}/{total_chunks} chunks...")
+        pct = round(written / total_chunks * 100)
+        print(f"  Written {written}/{total_chunks} chunks ({pct}%)...")
 
-    print(f"\n Full index complete — {len(source_files)} files, {total_chunks} chunks")
+    print(f"\nFull index complete — {len(source_files)} files, {written} chunks written")
     return collection
 
 
@@ -384,7 +387,7 @@ def ingest_incremental(codebase_path: str, since_commit: str, include_tests: boo
 
         total_chunks += index_file(collection, abs_path, rel_path)
 
-    print(f"\n Incremental update complete — {len(changed)} files, {total_chunks} chunks added/updated")
+    print(f"\nIncremental update complete — {len(changed)} files, {total_chunks} chunks added/updated")
 
 
 def main():
@@ -399,27 +402,37 @@ def main():
         sys.exit(1)
 
     codebase_path = os.path.abspath(args.path)
+    project_name = get_project_name(codebase_path)
+    chroma_path = get_chroma_path(codebase_path)
     current_commit = get_current_commit(codebase_path)
-    last_commit = get_last_indexed_commit()
+    last_commit = get_last_indexed_commit(codebase_path)
 
-    print(f"Codebase:      {codebase_path}")
+    print(f"Project:       {project_name}")
+    print(f"Database:      {chroma_path}")
     print(f"Current HEAD:  {current_commit[:8] if current_commit else 'N/A'}")
     print(f"Last indexed:  {last_commit[:8] if last_commit else 'none'}\n")
 
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    client = chromadb.PersistentClient(path=chroma_path)
     st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
     embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL,
         device="mps"
     )
 
-    if args.full or not last_commit or not current_commit:
+    if args.full:
+        try:
+            client.delete_collection(COLLECTION_NAME)
+            print("Deleted existing collection")
+        except Exception:
+            pass
+        ingest_full(codebase_path, args.include_tests, client, embed_fn, st_model)
+    elif not last_commit or not current_commit:
         ingest_full(codebase_path, args.include_tests, client, embed_fn, st_model)
     else:
         ingest_incremental(codebase_path, last_commit, args.include_tests, client, embed_fn)
 
     if current_commit:
-        save_commit_hash(current_commit)
+        save_commit_hash(codebase_path, current_commit)
         print(f"Saved commit hash: {current_commit[:8]}")
 
 
