@@ -5,10 +5,8 @@ import signal
 import subprocess
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import torch
 import chromadb
 from chromadb.utils import embedding_functions
-from sentence_transformers import SentenceTransformer
 from tree_sitter import Language, Parser
 import tree_sitter_java as tsjava
 import tree_sitter_typescript as tstype
@@ -297,13 +295,8 @@ def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
 def embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path: str, start_from: int = 0):
     total = len(all_ids)
     written = start_from
+    embedder_path = os.path.join(BASE_DIR, "embedder.py")
     print(f"Embedding and writing {total - start_from} chunks (starting from {start_from})...")
-
-    try:
-        st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
-    except Exception as e:
-        print(f"Failed to load embedding model: {e}")
-        sys.exit(1)
 
     for i in range(start_from, total, EMBED_BATCH_SIZE):
         batch_docs  = all_docs[i:i+EMBED_BATCH_SIZE]
@@ -311,13 +304,20 @@ def embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path: str
         batch_metas = all_metas[i:i+EMBED_BATCH_SIZE]
 
         try:
-            embeddings = st_model.encode(
-                batch_docs,
-                batch_size=32,
-                show_progress_bar=False,
-                convert_to_numpy=True
+            result = subprocess.run(
+                [sys.executable, embedder_path],
+                input=json.dumps({"docs": batch_docs}),
+                capture_output=True,
+                text=True,
+                timeout=120
             )
-            torch.mps.empty_cache()
+            if result.returncode != 0:
+                print(f"  Embedder failed for batch at {i}: {result.stderr}")
+                continue
+            embeddings = json.loads(result.stdout)["embeddings"]
+        except subprocess.TimeoutExpired:
+            print(f"  Embedder timed out for batch at {i}, skipping...")
+            continue
         except Exception as e:
             print(f"  Embedding failed for batch at {i}: {e}")
             continue
@@ -325,7 +325,7 @@ def embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path: str
         try:
             collection.add(
                 documents=batch_docs,
-                embeddings=embeddings.tolist(),
+                embeddings=embeddings,
                 metadatas=batch_metas,
                 ids=batch_ids
             )
@@ -377,9 +377,8 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
     print(f"Parsing files with {PARALLEL_WORKERS} workers...")
     all_chunks_by_file = {}
     pairs = [(fp, os.path.relpath(fp, codebase_path)) for fp in source_files]
-    executor = ThreadPoolExecutor(max_workers=PARALLEL_WORKERS)
 
-    try:
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
         futures = {executor.submit(parse_file, fp, rp): rp for fp, rp in pairs}
         for i, future in enumerate(as_completed(futures)):
             try:
@@ -392,8 +391,6 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn):
                 print(f"  Worker timed out, skipping...")
             except Exception as e:
                 print(f"  Worker failed: {e}")
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
 
     print("Collecting chunks...")
     all_ids, all_docs, all_metas = [], [], []
@@ -480,7 +477,6 @@ def ingest_incremental(codebase_path: str, since_commit: str, include_tests: boo
 def main():
     def handle_exit(sig, frame):
         print("\nShutting down...")
-        torch.mps.empty_cache()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_exit)
