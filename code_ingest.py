@@ -230,6 +230,7 @@ def index_file(collection, file_path: str, rel_path: str):
 
 
 def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
+    print(f"  Parsing {rel_path}...")
     ext = os.path.splitext(file_path)[1]
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
