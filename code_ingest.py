@@ -1,21 +1,6 @@
-"""
-code_ingest.py — Index a Java/TypeScript/TSX/JS/YAML codebase into ChromaDB using tree-sitter
-
-First run (full index):
-    python code_ingest.py /path/to/your/codebase
-
-Subsequent runs (incremental — only changed files since last index):
-    python code_ingest.py /path/to/your/codebase
-
-Force full re-index:
-    python code_ingest.py /path/to/your/codebase --full
-
-Requirements:
-    pip install chromadb tree-sitter tree-sitter-java tree-sitter-typescript tree-sitter-javascript tree-sitter-yaml sentence-transformers
-"""
-
 import os
 import sys
+import json
 import subprocess
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -29,12 +14,10 @@ import tree_sitter_yaml as tsyaml
 from sentence_transformers import SentenceTransformer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHROMA_PATH = os.path.join(BASE_DIR, "codebase_chroma_db")
 COLLECTION_NAME = "codebase"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
-COMMIT_HASH_FILE = os.path.join(BASE_DIR, ".last_indexed_commit")
-BATCH_SIZE = 500
-PARALLEL_WORKERS = 4
+BATCH_SIZE = 50
+PARALLEL_WORKERS = 2
 
 CHUNK_NODE_TYPES = {
     ".java": {
@@ -80,19 +63,42 @@ CHUNK_NODE_TYPES = {
 SUPPORTED_EXTENSIONS = set(CHUNK_NODE_TYPES.keys())
 YAML_EXTENSIONS = {".yaml", ".yml"}
 
-PARSERS = {
-    ".java": Parser(Language(tsjava.language())),
-    ".ts":   Parser(Language(tstype.language_typescript())),
-    ".tsx":  Parser(Language(tstype.language_tsx())),
-    ".js":   Parser(Language(tsjs.language())),
-    ".mjs":  Parser(Language(tsjs.language())),
-    ".yaml": Parser(Language(tsyaml.language())),
-    ".yml":  Parser(Language(tsyaml.language())),
-}
+
+def make_parsers() -> dict:
+    return {
+        ".java": Parser(Language(tsjava.language())),
+        ".ts":   Parser(Language(tstype.language_typescript())),
+        ".tsx":  Parser(Language(tstype.language_tsx())),
+        ".js":   Parser(Language(tsjs.language())),
+        ".mjs":  Parser(Language(tsjs.language())),
+        ".yaml": Parser(Language(tsyaml.language())),
+        ".yml":  Parser(Language(tsyaml.language())),
+    }
+
+PARSERS = make_parsers()
+
+
+def get_project_name(codebase_path: str) -> str:
+    return os.path.basename(codebase_path.rstrip("/"))
+
+
+def get_chroma_path(codebase_path: str) -> str:
+    return os.path.join(BASE_DIR, f"codebase_chroma_db_{get_project_name(codebase_path)}")
+
+
+def get_commit_hash_file(codebase_path: str) -> str:
+    return os.path.join(BASE_DIR, f".last_indexed_commit_{get_project_name(codebase_path)}")
+
+
+def get_chunks_cache_file(codebase_path: str) -> str:
+    return os.path.join(BASE_DIR, f".chunks_cache_{get_project_name(codebase_path)}.json")
+
+
+def get_progress_file(codebase_path: str) -> str:
+    return os.path.join(BASE_DIR, f".ingest_progress_{get_project_name(codebase_path)}")
 
 
 def get_current_commit(codebase_path: str) -> str | None:
-    """Return the current HEAD commit hash."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -104,26 +110,46 @@ def get_current_commit(codebase_path: str) -> str | None:
         return None
 
 
-def get_last_indexed_commit() -> str | None:
+def get_last_indexed_commit(codebase_path: str) -> str | None:
     try:
-        with open(COMMIT_HASH_FILE, "r") as f:
+        with open(get_commit_hash_file(codebase_path), "r") as f:
             return f.read().strip()
     except FileNotFoundError:
         return None
 
 
-def save_commit_hash(commit_hash: str):
-    """Save the current commit hash to disk."""
-    with open(COMMIT_HASH_FILE, "w") as f:
+def save_commit_hash(codebase_path: str, commit_hash: str):
+    with open(get_commit_hash_file(codebase_path), "w") as f:
         f.write(commit_hash)
 
 
+def save_chunks_cache(codebase_path: str, all_ids, all_docs, all_metas):
+    print("Saving chunks to disk...")
+    with open(get_chunks_cache_file(codebase_path), "w") as f:
+        json.dump({"ids": all_ids, "docs": all_docs, "metas": all_metas}, f)
+    print(f"  Saved {len(all_ids)} chunks to cache")
+
+
+def load_chunks_cache(codebase_path: str):
+    with open(get_chunks_cache_file(codebase_path), "r") as f:
+        data = json.load(f)
+    return data["ids"], data["docs"], data["metas"]
+
+
+def save_progress(codebase_path: str, chunks_written: int):
+    with open(get_progress_file(codebase_path), "w") as f:
+        f.write(str(chunks_written))
+
+
+def clear_progress_files(codebase_path: str):
+    for f in [get_chunks_cache_file(codebase_path), get_progress_file(codebase_path)]:
+        try:
+            os.remove(f)
+        except FileNotFoundError:
+            pass
+
+
 def get_changed_files(codebase_path: str, since_commit: str) -> dict[str, str]:
-    """
-    Return files changed between since_commit and HEAD.
-    Returns a dict of {relative_path: status} where status is:
-      'M' = modified, 'A' = added, 'D' = deleted, 'R' = renamed
-    """
     try:
         result = subprocess.run(
             ["git", "diff", "--name-status", since_commit, "HEAD"],
@@ -143,10 +169,10 @@ def get_changed_files(codebase_path: str, since_commit: str) -> dict[str, str]:
         return {}
 
 
-def extract_chunks(source: str, file_path: str, ext: str) -> list[dict]:
-    parser = PARSERS[ext]
+def extract_chunks(source: str, file_path: str, ext: str, parsers: dict = None) -> list[dict]:
+    p = parsers[ext] if parsers else PARSERS[ext]
     node_types = CHUNK_NODE_TYPES[ext]
-    tree = parser.parse(bytes(source, "utf-8"))
+    tree = p.parse(bytes(source, "utf-8"))
     chunks = []
 
     if ext in YAML_EXTENSIONS:
@@ -183,7 +209,6 @@ def extract_chunks(source: str, file_path: str, ext: str) -> list[dict]:
 
 
 def find_source_files(root: str) -> list[str]:
-    """Recursively find all supported source files, skipping non-essential dirs."""
     skip_dirs = {"target", "build", ".git", ".idea", "node_modules", "__pycache__", "dist", ".next"}
     source_files = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -244,6 +269,7 @@ def index_file(collection, file_path: str, rel_path: str):
 
 
 def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
+    local_parsers = make_parsers()
     ext = os.path.splitext(file_path)[1]
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -251,7 +277,39 @@ def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
     except Exception as e:
         print(f"  Could not read {file_path}: {e}")
         return rel_path, []
-    return rel_path, extract_chunks(source, rel_path, ext)
+    return rel_path, extract_chunks(source, rel_path, ext, local_parsers)
+
+
+def embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path: str, st_model, start_from: int = 0):
+    total = len(all_ids)
+    written = start_from
+    print(f"Embedding and writing {total - start_from} chunks (starting from {start_from})...")
+
+    for i in range(start_from, total, BATCH_SIZE):
+        batch_docs  = all_docs[i:i+BATCH_SIZE]
+        batch_ids   = all_ids[i:i+BATCH_SIZE]
+        batch_metas = all_metas[i:i+BATCH_SIZE]
+
+        embeddings = st_model.encode(
+            batch_docs,
+            batch_size=32,
+            show_progress_bar=True,
+            convert_to_numpy=True
+        )
+
+        collection.upsert(
+            documents=batch_docs,
+            embeddings=embeddings.tolist(),
+            metadatas=batch_metas,
+            ids=batch_ids
+        )
+
+        written += len(batch_ids)
+        save_progress(codebase_path, written)
+        pct = round(written / total * 100)
+        print(f"  Written {written}/{total} chunks ({pct}%)...")
+
+    return written
 
 
 def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_model):
@@ -298,7 +356,8 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
                 rel_path, chunks = future.result()
                 all_chunks_by_file[rel_path] = chunks
                 if (i + 1) % 10 == 0:
-                    print(f"  Parsed {i + 1}/{len(source_files)} files...")
+                    pct = round((i + 1) / len(source_files) * 100)
+                    print(f"  Parsed {i+1}/{len(source_files)} files ({pct}%)...")
             except Exception as e:
                 print(f"  Worker failed: {e}")
 
@@ -317,34 +376,27 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
                 "language": ext.lstrip(".")
             })
 
-    total_chunks = len(all_ids)
-    print(f"Embedding and writing {total_chunks} chunks in batches of {BATCH_SIZE}...")
+    save_chunks_cache(codebase_path, all_ids, all_docs, all_metas)
+    written = embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path, st_model)
+    clear_progress_files(codebase_path)
 
-    written = 0
-    for i in range(0, total_chunks, BATCH_SIZE):
-        batch_docs  = all_docs[i:i+BATCH_SIZE]
-        batch_ids   = all_ids[i:i+BATCH_SIZE]
-        batch_metas = all_metas[i:i+BATCH_SIZE]
-
-        embeddings = st_model.encode(
-            batch_docs,
-            batch_size=32,
-            show_progress_bar=True,
-            convert_to_numpy=True
-        )
-
-        collection.add(
-            documents=batch_docs,
-            embeddings=embeddings.tolist(),
-            metadatas=batch_metas,
-            ids=batch_ids
-        )
-
-        written += len(batch_ids)
-        print(f"  Written {written}/{total_chunks} chunks...")
-
-    print(f"\n Full index complete — {len(source_files)} files, {total_chunks} chunks")
+    print(f"\nFull index complete — {len(source_files)} files, {written} chunks")
     return collection
+
+
+def ingest_resume(codebase_path: str, client, embed_fn, st_model):
+    print("Loading chunks from cache...")
+    all_ids, all_docs, all_metas = load_chunks_cache(codebase_path)
+    total = len(all_ids)
+
+    collection = get_or_create_collection(client, embed_fn)
+    start_from = collection.count()
+    print(f"Found {start_from} chunks in DB, {total} total — resuming from {start_from}...")
+
+    written = embed_and_write(collection, all_ids, all_docs, all_metas, codebase_path, st_model, start_from)
+    clear_progress_files(codebase_path)
+
+    print(f"\nResume complete — {written} chunks written")
 
 
 def ingest_incremental(codebase_path: str, since_commit: str, include_tests: bool, client, embed_fn):
@@ -367,7 +419,6 @@ def ingest_incremental(codebase_path: str, since_commit: str, include_tests: boo
 
     for rel_path, status in changed.items():
         print(f"  [{status}] {rel_path}")
-
         delete_file_chunks(collection, rel_path)
 
         if status == "D":
@@ -384,7 +435,7 @@ def ingest_incremental(codebase_path: str, since_commit: str, include_tests: boo
 
         total_chunks += index_file(collection, abs_path, rel_path)
 
-    print(f"\n Incremental update complete — {len(changed)} files, {total_chunks} chunks added/updated")
+    print(f"\nIncremental update complete — {len(changed)} files, {total_chunks} chunks added/updated")
 
 
 def main():
@@ -399,27 +450,36 @@ def main():
         sys.exit(1)
 
     codebase_path = os.path.abspath(args.path)
+    project_name = get_project_name(codebase_path)
+    chroma_path = get_chroma_path(codebase_path)
     current_commit = get_current_commit(codebase_path)
-    last_commit = get_last_indexed_commit()
+    last_commit = get_last_indexed_commit(codebase_path)
 
-    print(f"Codebase:      {codebase_path}")
+    print(f"Project:       {project_name}")
+    print(f"Database:      {chroma_path}")
     print(f"Current HEAD:  {current_commit[:8] if current_commit else 'N/A'}")
     print(f"Last indexed:  {last_commit[:8] if last_commit else 'none'}\n")
 
-    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    client = chromadb.PersistentClient(path=chroma_path)
     st_model = SentenceTransformer(EMBEDDING_MODEL, device="mps")
     embed_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL,
         device="mps"
     )
 
-    if args.full or not last_commit or not current_commit:
+    if args.full:
+        clear_progress_files(codebase_path)
+        ingest_full(codebase_path, args.include_tests, client, embed_fn, st_model)
+    elif os.path.exists(get_chunks_cache_file(codebase_path)):
+        print("Incomplete previous run detected — resuming...")
+        ingest_resume(codebase_path, client, embed_fn, st_model)
+    elif not last_commit or not current_commit:
         ingest_full(codebase_path, args.include_tests, client, embed_fn, st_model)
     else:
         ingest_incremental(codebase_path, last_commit, args.include_tests, client, embed_fn)
 
     if current_commit:
-        save_commit_hash(current_commit)
+        save_commit_hash(codebase_path, current_commit)
         print(f"Saved commit hash: {current_commit[:8]}")
 
 
