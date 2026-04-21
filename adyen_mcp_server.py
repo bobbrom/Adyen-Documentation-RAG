@@ -16,11 +16,8 @@ from chromadb.utils import embedding_functions
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
-import os
 
-BASE_PATH = os.path.dirname(__file__)
-
-CHROMA_PATH = os.path.join(BASE_PATH, "adyen_chroma_db")
+CHROMA_PATH = "./adyen_chroma_db"
 COLLECTION_NAME = "adyen_docs"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 TOP_K = 5
@@ -76,11 +73,15 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     )
 
     chunks = []
+    urls = []
     for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
         url = meta["url"].replace(".md", "")
         chunks.append(f"Source: {url}\n\n{doc}")
+        if url not in urls:
+            urls.append(url)
 
     output = "\n\n---\n\n".join(chunks)
+    output += "\n\n## Sources\n" + "\n".join(f"- {url}" for url in urls)
     return [types.TextContent(type="text", text=output)]
 
 
