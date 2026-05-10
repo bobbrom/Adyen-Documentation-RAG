@@ -15,8 +15,11 @@ from sentence_transformers import SentenceTransformer
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COLLECTION_NAME = "codebase"
 EMBEDDING_MODEL = "nomic-ai/nomic-embed-code"
-BATCH_SIZE = 100
-PARALLEL_WORKERS = 2
+BATCH_SIZE = 50
+PARALLEL_WORKERS = 4
+MAX_CHUNK_CHARS = 10000
+
+sys.setrecursionlimit(5000)
 
 CHUNK_NODE_TYPES = {
     ".java": {
@@ -230,7 +233,6 @@ def index_file(collection, file_path: str, rel_path: str):
 
 
 def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
-    print(f"  Parsing {rel_path}...")
     ext = os.path.splitext(file_path)[1]
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -239,6 +241,42 @@ def parse_file(file_path: str, rel_path: str) -> tuple[str, list[dict]]:
         print(f"  Could not read {file_path}: {e}")
         return rel_path, []
     return rel_path, extract_chunks(source, rel_path, ext)
+
+
+def split_large_chunk(chunk: dict, max_chars: int) -> list[dict]:
+    text = chunk["text"]
+    if len(text) <= max_chars:
+        return [chunk]
+
+    lines = text.splitlines()
+    parts = []
+    current_lines = []
+    current_len = 0
+    part_num = 0
+
+    for line in lines:
+        if current_len + len(line) > max_chars and current_lines:
+            parts.append({
+                **chunk,
+                "text": "\n".join(current_lines),
+                "start_line": chunk["start_line"] + (part_num * len(current_lines)),
+                "part": part_num
+            })
+            current_lines = []
+            current_len = 0
+            part_num += 1
+        current_lines.append(line)
+        current_len += len(line)
+
+    if current_lines:
+        parts.append({
+            **chunk,
+            "text": "\n".join(current_lines),
+            "start_line": chunk["start_line"] + (part_num * len(current_lines)),
+            "part": part_num
+        })
+
+    return parts
 
 
 def get_existing_ids(collection) -> set[str]:
@@ -300,21 +338,31 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
 
     print("Collecting chunks...")
     all_ids, all_docs, all_metas = [], [], []
+    oversized = 0
     for rel_path, chunks in all_chunks_by_file.items():
         ext = os.path.splitext(rel_path)[1]
         for c in chunks:
-            chunk_id = f"{rel_path}:{c['start_line']}"
-            if chunk_id in existing_ids:
-                continue
-            all_ids.append(chunk_id)
-            all_docs.append(c["text"])
-            all_metas.append({
-                "file": c["file"],
-                "type": c["type"],
-                "start_line": c["start_line"],
-                "end_line": c["end_line"],
-                "language": ext.lstrip(".")
-            })
+            parts = split_large_chunk(c, MAX_CHUNK_CHARS)
+            if len(parts) > 1:
+                oversized += 1
+                print(f"  Split oversized chunk in {rel_path} line {c['start_line']} ({len(c['text'])} chars) into {len(parts)} parts")
+            for part in parts:
+                chunk_id = f"{rel_path}:{part['start_line']}:{part.get('part', 0)}"
+                if chunk_id in existing_ids:
+                    continue
+                all_ids.append(chunk_id)
+                all_docs.append(part["text"])
+                all_metas.append({
+                    "file": part["file"],
+                    "type": part["type"],
+                    "start_line": part["start_line"],
+                    "end_line": part["end_line"],
+                    "language": ext.lstrip(".")
+                })
+
+    if oversized:
+        print(f"  Split {oversized} oversized chunks")
+    print(f"  Collected {len(all_ids)} chunks (avg size: {round(sum(len(d) for d in all_docs) / max(len(all_docs), 1))} chars)")
 
     total_chunks = len(all_ids)
     if total_chunks == 0:
@@ -328,7 +376,7 @@ def ingest_full(codebase_path: str, include_tests: bool, client, embed_fn, st_mo
         batch_docs  = all_docs[i:i+BATCH_SIZE]
         batch_ids   = all_ids[i:i+BATCH_SIZE]
         batch_metas = all_metas[i:i+BATCH_SIZE]
-        print(f"  Encoding batch {i // BATCH_SIZE + 1} ({len(batch_docs)} chunks)...")
+
         embeddings = st_model.encode(
             batch_docs,
             batch_size=32,
